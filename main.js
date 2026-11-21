@@ -12,7 +12,7 @@ function activeTab() {
 }
 
 function sendTabs() {
-  if (!win || win.isDestroyed()) return;
+  if (!win || win.isDestroyed() || win.webContents.isDestroyed()) return;
   win.webContents.send('tabs-changed', {
     tabs: tabs.map(({ id, title, url, loading }) => ({ id, title, url, loading })),
     activeTabId
@@ -22,13 +22,13 @@ function sendTabs() {
 function resizeActiveView() {
   if (!win || win.isDestroyed()) return;
   const tab = activeTab();
-  if (!tab) return;
+  if (!tab || !tab.attached || tab.view.webContents.isDestroyed()) return;
   const [width, height] = win.getContentSize();
   tab.view.setBounds({ x: 0, y: CHROME_HEIGHT, width, height: Math.max(100, height - CHROME_HEIGHT) });
 }
 
 function attachTabView(tab) {
-  if (!win || !tab) return;
+  if (!win || !tab || tab.view.webContents.isDestroyed()) return;
   for (const other of tabs) {
     if (other.attached) {
       win.contentView.removeChildView(other.view);
@@ -57,10 +57,15 @@ function createTab(initialUrl = '', shouldAttach = true) {
   if (!win) return null;
   const id = String(nextTabId++);
   const view = new WebContentsView({
-    webPreferences: { contextIsolation: true, sandbox: true }
+    webPreferences: {
+      contextIsolation: true,
+      sandbox: true,
+      backgroundThrottling: true
+    }
   });
   const tab = { id, view, title: 'Новая вкладка', url: '', loading: false, attached: false };
   tabs.push(tab);
+
   view.webContents.setWindowOpenHandler(({ url }) => {
     createTab(url);
     return { action: 'deny' };
@@ -80,29 +85,41 @@ function createTab(initialUrl = '', shouldAttach = true) {
   const updateUrl = (_event, url) => {
     tab.url = url;
     sendTabs();
-    if (win && activeTabId === tab.id) win.webContents.send('url-changed', url);
+    if (win && activeTabId === tab.id && !win.webContents.isDestroyed()) {
+      win.webContents.send('url-changed', url);
+    }
   };
   view.webContents.on('did-navigate', updateUrl);
   view.webContents.on('did-navigate-in-page', updateUrl);
   view.webContents.on('render-process-gone', () => {
     tab.title = 'Страница аварийно завершилась';
+    tab.loading = false;
     sendTabs();
   });
+
   if (shouldAttach) attachTabView(tab);
-  else { activeTabId = tab.id; sendTabs(); }
+  else {
+    activeTabId = tab.id;
+    sendTabs();
+  }
+
   if (initialUrl) navigateTab(tab, initialUrl);
-  else view.webContents.loadURL('https://www.google.com').catch(() => {});
+  else if (shouldAttach) {
+    view.webContents.loadURL('https://www.google.com').catch(() => {});
+  }
   return tab;
 }
 
 async function navigateTab(tab, input) {
-  if (!tab) return;
+  if (!tab || tab.view.webContents.isDestroyed()) return;
   const url = resolveAddress(input);
   attachTabView(tab);
   try {
     await tab.view.webContents.loadURL(url);
   } catch (error) {
-    if (win) win.webContents.send('navigation-error', error.message);
+    if (win && !win.isDestroyed() && !win.webContents.isDestroyed()) {
+      win.webContents.send('navigation-error', error.message);
+    }
   }
 }
 
@@ -112,7 +129,8 @@ function closeTab(id) {
   const [tab] = tabs.splice(index, 1);
   if (tab.attached && win) win.contentView.removeChildView(tab.view);
   tab.attached = false;
-  tab.view.webContents.close();
+  if (!tab.view.webContents.isDestroyed()) tab.view.webContents.close();
+
   if (!tabs.length) {
     createTab();
     return;
@@ -131,16 +149,19 @@ function createWindow() {
     height: 820,
     minWidth: 760,
     minHeight: 520,
-    backgroundColor: '#090a10',
+    backgroundColor: '#202124',
     title: 'VanaBROWSer',
     icon: path.join(__dirname, 'assets', 'icon.ico'),
     webPreferences: {
       preload: path.join(__dirname, 'preload.js'),
       contextIsolation: true,
-      nodeIntegration: false
+      nodeIntegration: false,
+      sandbox: true
     }
   });
+
   win.loadFile('index.html');
+  win.webContents.once('did-finish-load', sendTabs);
   win.on('resize', resizeActiveView);
   win.on('closed', () => {
     for (const tab of tabs) {
@@ -181,8 +202,13 @@ ipcMain.on('browser-action', (_event, action) => {
     sendTabs();
   }
 });
+
 app.whenReady().then(() => {
   createWindow();
-  app.on('activate', () => { if (BrowserWindow.getAllWindows().length === 0) createWindow(); });
+  app.on('activate', () => {
+    if (BrowserWindow.getAllWindows().length === 0) createWindow();
+  });
 });
-app.on('window-all-closed', () => { if (process.platform !== 'darwin') app.quit(); });
+app.on('window-all-closed', () => {
+  if (process.platform !== 'darwin') app.quit();
+});
